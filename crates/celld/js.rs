@@ -1873,6 +1873,21 @@ pub struct Compat {
     pub websocket_standard_binary_type: bool,
 }
 
+/// A non-main module the worker's main module may import, tagged by how the
+/// runtime materializes it.
+pub enum ModuleSource {
+    /// UTF-8 content served as `export default "<content>"` (wrangler's Text
+    /// rule), registered under the given specifier verbatim.
+    Text(String),
+    /// JS source compiled as a sibling ES module (Worker Loader multi-module
+    /// bundles), registered under both `name` and `./name`.
+    EsModule(String),
+    /// Wasm bytes served as a module whose default export is the compiled
+    /// `WebAssembly.Module` (Wrangler's `CompiledWasm` rule), registered
+    /// under both `name` and `./name`.
+    Wasm(bytes::Bytes),
+}
+
 pub struct WorkerConfig {
     src: String,
     script_name: String,
@@ -1882,7 +1897,8 @@ pub struct WorkerConfig {
     ai_binding: Option<String>,
     vars: Vec<(String, String)>,
     node: String,
-    text: Vec<(String, String)>,
+    /// The worker's non-main modules, so the main module can import siblings.
+    modules: Vec<(String, ModuleSource)>,
     compat: Compat,
     /// `[[services]]`: (binding name, target script, optional entrypoint).
     /// The target runs in this process; see [[service-bindings]].
@@ -1896,9 +1912,6 @@ pub struct WorkerConfig {
     /// Extra `env` values a loaded worker was handed, as a JSON object string
     /// merged onto its `env`. Loader-only; empty for normal workers.
     loader_env: Option<String>,
-    /// A loaded worker's non-main modules as (name, source), so the main module
-    /// can import siblings. Loader-only; empty for normal single-file bundles.
-    loader_modules: Vec<(String, String)>,
 }
 
 pub struct WorkerConfigOptions {
@@ -1910,7 +1923,7 @@ pub struct WorkerConfigOptions {
     pub ai_binding: Option<String>,
     pub vars: Vec<(String, String)>,
     pub node: String,
-    pub text: Vec<(String, String)>,
+    pub modules: Vec<(String, ModuleSource)>,
     pub compat: Compat,
 }
 
@@ -1925,7 +1938,7 @@ impl WorkerConfig {
             ai_binding,
             vars,
             node,
-            text,
+            modules,
             compat,
         } = options;
         Self {
@@ -1937,14 +1950,13 @@ impl WorkerConfig {
             ai_binding,
             vars,
             node,
-            text,
+            modules,
             compat,
             services: Vec::new(),
             asset_binding: None,
             loader_binding: None,
             egress: EgressPolicy::Allow,
             loader_env: None,
-            loader_modules: Vec::new(),
         }
     }
 
@@ -1963,12 +1975,6 @@ impl WorkerConfig {
     /// Merge `env` (a JSON object string) onto a loaded worker's `env`.
     fn with_loader_env(mut self, env: Option<String>) -> Self {
         self.loader_env = env;
-        self
-    }
-
-    /// Non-main modules a loaded worker's main module may import.
-    fn with_loader_modules(mut self, modules: Vec<(String, String)>) -> Self {
-        self.loader_modules = modules;
         self
     }
 
@@ -2167,7 +2173,6 @@ impl Worker {
         let script_name = config.script_name.as_str();
         let do_classes = config.do_classes.as_slice();
         let node = config.node.as_str();
-        let text = config.text.as_slice();
         let compat = config.compat;
         let params = v8::CreateParams::default().heap_limits(0, v8_heap_limit_bytes());
         let mut isolate = v8::Isolate::new(params);
@@ -2204,10 +2209,9 @@ impl Worker {
                 Some(m) => m,
                 None => return Err(anyhow!("compile: {}", exc!(scope))),
             };
-            register_stubs(scope, src, text); // cloudflare:*/node:* + text modules
-            if !config.loader_modules.is_empty() {
-                register_loader_modules(scope, &config.loader_modules);
-            }
+            register_stubs(scope, src, &config.modules); // cloudflare:*/node:* + text modules
+            register_wasm_modules(scope, &config.modules);
+            register_loader_modules(scope, &config.modules);
             module
                 .instantiate_module(scope, resolve_external)
                 .ok_or_else(|| anyhow!("instantiate: {}", exc!(scope)))?;
@@ -2271,11 +2275,31 @@ impl Worker {
                 .to_object(scope)
                 .ok_or_else(|| anyhow!("default not object"))?;
             let fk = v8::String::new(scope, "fetch").unwrap();
-            let f: v8::Local<v8::Function> = default
+            let fetch_value = default
                 .get(scope, fk.into())
-                .ok_or_else(|| anyhow!("no fetch"))?
-                .try_into()
-                .map_err(|_| anyhow!("fetch not fn"))?;
+                .ok_or_else(|| anyhow!("no fetch"))?;
+            let default_is_entrypoint =
+                default.is_function() && cell_registry_has(scope, "entrypoints", "default")?;
+            let f: v8::Local<v8::Function> = if fetch_value.is_function() {
+                fetch_value.try_into().expect("function casts to Function")
+            } else if default_is_entrypoint {
+                // A class-based default entrypoint (extends WorkerEntrypoint)
+                // keeps fetch on the prototype, so route through the
+                // harness's cached instance like a named entrypoint. Only a
+                // registered entrypoint dispatches that way — any other
+                // callable would load fine and then 500 on every request.
+                compile_fn(
+                    scope,
+                    "(req) => globalThis.__dispatchEntrypointFetch('default', req)",
+                )?
+            } else if default.is_function() && cell_registry_has(scope, "doExports", "default")? {
+                return Err(anyhow!(
+                    "the default export is a Durable Object class; export a fetch \
+                     handler or a WorkerEntrypoint class as the default"
+                ));
+            } else {
+                return Err(anyhow!("fetch not fn"));
+            };
 
             // Lets a self-targeted service binding invoke the handler in
             // this isolate instead of crossing to a pool thread.
@@ -2291,10 +2315,27 @@ impl Worker {
                     // Optional scheduled handler, reached by a self-targeted
                     // service binding's scheduled().
                     let sk = v8::String::new(scope, "scheduled").unwrap();
-                    if let Some(handler) = default.get(scope, sk.into()) {
-                        if handler.is_function() {
-                            let key_ = v8::String::new(scope, "selfScheduled").unwrap();
-                            cell.set(scope, key_.into(), handler);
+                    let key_ = v8::String::new(scope, "selfScheduled").unwrap();
+                    let own = default
+                        .get(scope, sk.into())
+                        .filter(|handler| handler.is_function());
+                    if let Some(handler) = own {
+                        cell.set(scope, key_.into(), handler);
+                    } else if default_is_entrypoint {
+                        // A class-based default entrypoint keeps scheduled on
+                        // the prototype; dispatch through the cached instance
+                        // like fetch above.
+                        let pk = v8::String::new(scope, "prototype").unwrap();
+                        let proto_scheduled = default
+                            .get(scope, pk.into())
+                            .and_then(|proto| proto.to_object(scope))
+                            .and_then(|proto| proto.get(scope, sk.into()));
+                        if proto_scheduled.is_some_and(|handler| handler.is_function()) {
+                            let shim = compile_fn(
+                                scope,
+                                "(ctrl) => globalThis.__dispatchEntrypointScheduled('default', ctrl)",
+                            )?;
+                            cell.set(scope, key_.into(), shim.into());
                         }
                     }
                 }
@@ -3185,25 +3226,58 @@ fn op_loader_load(
         );
     };
     // Every module other than the main one is a sibling the main module may
-    // import.
-    let loader_modules: Vec<(String, String)> = code
-        .get("modules")
-        .and_then(|m| m.as_object())
-        .map(|m| {
-            m.iter()
-                .filter(|(name, _)| name.as_str() != main)
-                .filter_map(|(name, v)| v.as_str().map(|s| (name.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
+    // import. JS modules arrive in the JSON as strings; anything else there is
+    // rejected — JSON.stringify would already have mangled it, and dropping it
+    // silently leaves the loaded worker failing instantiation with an
+    // unresolved specifier that never names the cause. Wasm modules arrive
+    // out of band as the second argument, an array of `[name, Uint8Array]`
+    // pairs, which keeps the blobs out of the JSON payload entirely.
+    let mut modules: Vec<(String, ModuleSource)> = Vec::new();
+    if let Some(map) = code.get("modules").and_then(|m| m.as_object()) {
+        for (name, value) in map.iter().filter(|(name, _)| name.as_str() != main) {
+            let Some(source) = value.as_str() else {
+                return loader_throw(
+                    scope,
+                    &format!("worker loader: module {name:?} must be a string or wasm bytes"),
+                );
+            };
+            modules.push((name.clone(), ModuleSource::EsModule(source.to_string())));
+        }
+    }
+    let sideband = args.get(1);
+    if !sideband.is_undefined() {
+        let Ok(entries) = v8::Local::<v8::Array>::try_from(sideband) else {
+            return loader_throw(scope, "worker loader: wasm modules must be an array");
+        };
+        for index in 0..entries.length() {
+            let entry = entries
+                .get_index(scope, index)
+                .and_then(|entry| v8::Local::<v8::Array>::try_from(entry).ok())
+                .and_then(|pair| Some((pair.get_index(scope, 0)?, pair.get_index(scope, 1)?)))
+                .filter(|(name, _)| name.is_string())
+                .and_then(|(name, value)| {
+                    let view = v8::Local::<v8::ArrayBufferView>::try_from(value).ok()?;
+                    Some((name.to_rust_string_lossy(scope), view))
+                });
+            let Some((name, view)) = entry else {
+                return loader_throw(scope, "worker loader: malformed wasm module entry");
+            };
+            let mut bytes = vec![0u8; view.byte_length()];
+            view.copy_contents(&mut bytes);
+            modules.push((name, ModuleSource::Wasm(bytes.into())));
+        }
+    }
     // Total module bytes, checked before compiling anything (the oversized
     // module is never parsed) — the extra modules are not yet loaded but do
     // count against the ceiling, as upstream.
-    let code_size: usize = code
-        .get("modules")
-        .and_then(|m| m.as_object())
-        .map(|m| m.values().filter_map(|v| v.as_str()).map(str::len).sum())
-        .unwrap_or(0);
+    let code_size: usize = src.len()
+        + modules
+            .iter()
+            .map(|(_, source)| match source {
+                ModuleSource::Text(source) | ModuleSource::EsModule(source) => source.len(),
+                ModuleSource::Wasm(bytes) => bytes.len(),
+            })
+            .sum::<usize>();
     if code_size > MAX_DYNAMIC_WORKER_CODE_SIZE {
         return loader_throw(
             scope,
@@ -3273,12 +3347,11 @@ fn op_loader_load(
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),
-            text: Vec::new(),
+            modules,
             compat,
         })
         .with_egress(egress)
-        .with_loader_env(loader_env)
-        .with_loader_modules(loader_modules),
+        .with_loader_env(loader_env),
     );
     let (tx, rx) = std::sync::mpsc::channel::<LoaderJob>();
     loader_registry().lock().unwrap().insert(id, tx);
@@ -6906,6 +6979,7 @@ fn register_entrypoints(scope: &mut v8::PinScope, ns: v8::Local<v8::Object>) -> 
         return Ok(());
     };
     let yes = v8::Boolean::new(scope, true);
+    let extends = compile_fn(scope, EXTENDS_SRC)?;
     for index in 0..names.length() {
         let Some(name) = names.get_index(scope, index) else {
             continue;
@@ -6921,23 +6995,84 @@ fn register_entrypoints(scope: &mut v8::PinScope, ns: v8::Local<v8::Object>) -> 
             }
             continue;
         }
-        // Walk the prototype chain rather than calling anything.
-        let mut proto = value.to_object(scope).and_then(|o| o.get_prototype(scope));
-        while let Some(current) = proto {
-            if current == entrypoint_base {
-                entrypoints.set(scope, name, value);
-                break;
-            }
-            if current == durable_base {
-                do_exports.set(scope, name, yes.into());
-                break;
-            }
-            proto = current
-                .to_object(scope)
-                .and_then(|o| o.get_prototype(scope));
+        // Walk the prototype chain rather than calling anything. The walk
+        // runs in JS: Reflect.getPrototypeOf honors Proxy exports (SDK shims
+        // like workers-rs wrap their classes), which the host-side
+        // Object::GetPrototype does not.
+        if call_extends(scope, extends, value, entrypoint_base)? {
+            entrypoints.set(scope, name, value);
+        } else if call_extends(scope, extends, value, durable_base)? {
+            do_exports.set(scope, name, yes.into());
         }
     }
     Ok(())
+}
+
+/// `(cls, base) => base is on cls's prototype chain`, via Reflect so Proxy
+/// wrappers report the prototype their handler exposes. A getPrototypeOf trap
+/// also makes the chain user-controlled (a cycle, or a fresh Proxy per hop,
+/// is spec-legal on an extensible target), so track visited links and cap the
+/// walk rather than let it hang the load.
+const EXTENDS_SRC: &str = "((cls, base) => { \
+    const seen = new Set(); \
+    for (let p = Reflect.getPrototypeOf(cls); p; p = Reflect.getPrototypeOf(p)) { \
+        if (p === base) return true; \
+        if (seen.has(p) || seen.size >= 1000) return false; \
+        seen.add(p); \
+    } \
+    return false; })";
+
+/// Compile and run a JS expression that evaluates to a function.
+fn compile_fn<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    src: &str,
+) -> Result<v8::Local<'s, v8::Function>> {
+    let code = v8::String::new(scope, src).unwrap();
+    let script =
+        v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("compile shim: {src}"))?;
+    let value = script
+        .run(scope)
+        .ok_or_else(|| anyhow!("run shim: {src}"))?;
+    value
+        .try_into()
+        .map_err(|_| anyhow!("shim is not a function: {src}"))
+}
+
+/// The walk crosses into user code when an export is a Proxy, so it can throw
+/// (a revoked Proxy, a throwing getPrototypeOf trap). Pin a TryCatch and
+/// surface that as a load error rather than misclassifying the export.
+fn call_extends(
+    scope: &mut v8::PinScope,
+    extends: v8::Local<v8::Function>,
+    class: v8::Local<v8::Value>,
+    base: v8::Local<v8::Value>,
+) -> Result<bool> {
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut tc.init();
+    let recv = v8::undefined(scope).into();
+    match extends.call(scope, recv, &[class, base]) {
+        Some(result) => Ok(result.is_true()),
+        None => Err(anyhow!("inspect export prototype chain: {}", exc!(scope))),
+    }
+}
+
+/// Whether `register_entrypoints` put `name` in the `__cell.<registry>`
+/// object (e.g. `entrypoints`, `doExports`).
+fn cell_registry_has(scope: &mut v8::PinScope, registry: &str, name: &str) -> Result<bool> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cell_key = v8::String::new(scope, "__cell").unwrap();
+    let registry_key = v8::String::new(scope, registry).unwrap();
+    let registry_obj = global
+        .get(scope, cell_key.into())
+        .and_then(|value| value.to_object(scope))
+        .and_then(|cell| cell.get(scope, registry_key.into()))
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing __cell.{registry} registry"))?;
+    let name_key = v8::String::new(scope, name).unwrap();
+    Ok(registry_obj
+        .has_own_property(scope, name_key.into())
+        .unwrap_or(false))
 }
 
 /// Mark which cell scopes are local to this node and record the node id. Every
@@ -7404,7 +7539,7 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
 
 /// Compile one stub module per external specifier into MODREG. Run before
 /// instantiating a real bundle; `resolve_external` then serves them.
-fn register_stubs(scope: &mut v8::PinScope, src: &str, text: &[(String, String)]) {
+fn register_stubs(scope: &mut v8::PinScope, src: &str, modules: &[(String, ModuleSource)]) {
     MODREG.with(|r| r.borrow_mut().clear());
     let reg = |spec: String, source: String, scope: &mut v8::PinScope| {
         if let Some(m) = compile_module(scope, &spec, &source) {
@@ -7425,7 +7560,10 @@ fn register_stubs(scope: &mut v8::PinScope, src: &str, text: &[(String, String)]
         reg(spec, s, scope);
     }
     // sibling text modules (wrangler Text rule: `import md from './x.md'`)
-    for (spec, content) in text {
+    for (spec, source) in modules {
+        let ModuleSource::Text(content) = source else {
+            continue;
+        };
         let s = format!(
             "export default {};",
             serde_json::to_string(content).unwrap()
@@ -7438,14 +7576,161 @@ fn register_stubs(scope: &mut v8::PinScope, src: &str, text: &[(String, String)]
     );
 }
 
+/// Compile `source` and insert it into MODREG under both `name` and
+/// `./name`, so bare and relative sibling imports resolve to one module.
+fn register_sibling_module(scope: &mut v8::PinScope, name: &str, source: &str) {
+    let Some(m) = compile_module(scope, name, source) else {
+        tracing::warn!(%name, "sibling module failed to compile");
+        return;
+    };
+    let g = v8::Global::new(scope, m);
+    MODREG.with(|r| {
+        let mut reg = r.borrow_mut();
+        reg.insert(name.to_string(), g.clone());
+        reg.insert(format!("./{name}"), g);
+    });
+}
+
+/// Compiled-wasm modules shared process-wide: the first isolate to see a blob
+/// compiles it and caches the `CompiledWasmModule`; every later isolate (each
+/// pool thread, each DO cell activation) rehydrates that without recompiling,
+/// as workerd does via `FromCompiledModule`. Bounded LRU: deployed modules
+/// are fixed at startup (a redeploy restarts the process), but the Worker
+/// Loader can stream in distinct wasm blobs at runtime, so modules that
+/// evicted dynamic workers leave behind age out instead of accumulating
+/// for the life of the daemon.
+#[derive(Default)]
+struct CompiledWasmCache {
+    entries: HashMap<[u8; 32], (v8::CompiledWasmModule, u64)>,
+    tick: u64,
+}
+
+const MAX_COMPILED_WASM_MODULES: usize = 32;
+
+impl CompiledWasmCache {
+    fn get(&mut self, hash: &[u8; 32]) -> Option<&v8::CompiledWasmModule> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.entries.get_mut(hash).map(|(module, used)| {
+            *used = tick;
+            &*module
+        })
+    }
+
+    fn insert(&mut self, hash: [u8; 32], module: v8::CompiledWasmModule) {
+        if self.entries.len() >= MAX_COMPILED_WASM_MODULES {
+            let lru = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(hash, _)| *hash);
+            if let Some(lru) = lru {
+                self.entries.remove(&lru);
+            }
+        }
+        self.tick += 1;
+        self.entries.insert(hash, (module, self.tick));
+    }
+}
+
+/// Compile wasm bytes behind a TryCatch (so invalid bytes cannot leave a
+/// pending exception dangling over the rest of the load) and record the
+/// compiled module in the shared cache for later isolates.
+fn compile_wasm<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: &[u8],
+    hash: [u8; 32],
+    cache: &Mutex<CompiledWasmCache>,
+) -> Result<v8::Local<'s, v8::WasmModuleObject>, String> {
+    let compiled = {
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let tcs = &mut tc.init();
+        match v8::WasmModuleObject::compile(tcs, bytes) {
+            Some(module) => {
+                cache
+                    .lock()
+                    .unwrap()
+                    .insert(hash, module.get_compiled_module());
+                Ok(v8::Global::new(tcs, module))
+            }
+            None => Err(exc!(tcs)),
+        }
+    };
+    compiled.map(|module| v8::Local::new(scope, &module))
+}
+
+/// Register each sibling wasm module under its name and `./name` as a stub
+/// whose default export is the compiled `WebAssembly.Module` — the shape
+/// workerd gives a `CompiledWasm` module import, which is what
+/// wasm-bindgen/workers-rs bundles expect from `import x from "./x.wasm"`.
+/// Each stub reads its compiled module from `globalThis.__wasmModules`, and
+/// its one-time evaluation consumes that entry.
+fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String, ModuleSource)]) {
+    static COMPILED: OnceLock<Mutex<CompiledWasmCache>> = OnceLock::new();
+    let wasm = modules.iter().filter_map(|(name, source)| match source {
+        ModuleSource::Wasm(bytes) => Some((name, bytes)),
+        _ => None,
+    });
+    let mut table = None;
+    let cache = COMPILED.get_or_init(Default::default);
+    for (name, bytes) in wasm {
+        let table = *table.get_or_insert_with(|| {
+            let global = scope.get_current_context().global(scope);
+            let table = v8::Object::new(scope);
+            let table_key = v8::String::new(scope, "__wasmModules").unwrap();
+            global.set(scope, table_key.into(), table.into());
+            table
+        });
+        use sha2::Digest;
+        let hash: [u8; 32] = sha2::Sha256::digest(bytes).into();
+        let cached = {
+            let mut cache = cache.lock().unwrap();
+            cache
+                .get(&hash)
+                .and_then(|compiled| v8::WasmModuleObject::from_compiled_module(scope, compiled))
+        };
+        let module = match cached {
+            Some(module) => Ok(module),
+            None => compile_wasm(scope, bytes, hash, cache),
+        };
+        let quoted = serde_json::to_string(name).unwrap();
+        let source = match module {
+            Ok(module) => {
+                let key = v8::String::new(scope, name).unwrap();
+                table.set(scope, key.into(), module.into());
+                format!(
+                    "const m = globalThis.__wasmModules[{quoted}];\n\
+                     delete globalThis.__wasmModules[{quoted}];\n\
+                     export default m;"
+                )
+            }
+            // The importing module reports the failure, matching the eager
+            // `new WebAssembly.Module(bytes)` stub this replaces.
+            Err(error) => {
+                tracing::warn!(%name, %error, "wasm module failed to compile");
+                let message =
+                    serde_json::to_string(&format!("{name} failed to compile: {error}")).unwrap();
+                format!("throw new WebAssembly.CompileError({message});")
+            }
+        };
+        register_sibling_module(scope, name, &source);
+    }
+}
+
 /// Register a loaded worker's sibling JS modules (Worker Loader multi-module
 /// bundles), in addition to the builtins `register_stubs` already added for the
 /// main module. Each module is registered under its own name and `./name` so
 /// both bare and relative sibling imports resolve; the whole graph links when
 /// the main module instantiates. Any builtin a sibling imports (and the main
 /// module did not) is stubbed too.
-fn register_loader_modules(scope: &mut v8::PinScope, modules: &[(String, String)]) {
-    for (_name, source) in modules {
+fn register_loader_modules(scope: &mut v8::PinScope, modules: &[(String, ModuleSource)]) {
+    let es_modules = || {
+        modules.iter().filter_map(|(name, source)| match source {
+            ModuleSource::EsModule(source) => Some((name, source)),
+            _ => None,
+        })
+    };
+    for (_name, source) in es_modules() {
         for (spec, names) in scan_external_imports(source) {
             if MODREG.with(|r| r.borrow().contains_key(&spec)) {
                 continue;
@@ -7461,17 +7746,8 @@ fn register_loader_modules(scope: &mut v8::PinScope, modules: &[(String, String)
             }
         }
     }
-    for (name, source) in modules {
-        let Some(m) = compile_module(scope, name, source) else {
-            tracing::warn!(%name, "loader module failed to compile");
-            continue;
-        };
-        let g = v8::Global::new(scope, m);
-        MODREG.with(|r| {
-            let mut reg = r.borrow_mut();
-            reg.insert(name.clone(), g.clone());
-            reg.insert(format!("./{name}"), g);
-        });
+    for (name, source) in es_modules() {
+        register_sibling_module(scope, name, source);
     }
 }
 

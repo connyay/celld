@@ -4,8 +4,8 @@
 
 use crate::bucket::Bucket;
 use crate::deploy;
-use crate::js::WorkerConfigOptions;
-use crate::protocol::{DeployPointer, Manifest};
+use crate::js::{ModuleSource, WorkerConfigOptions};
+use crate::protocol::{DeployPointer, Manifest, ModuleKind};
 use anyhow::{bail, Context};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -339,11 +339,16 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
 }
 
 async fn get_string(bucket: &Bucket, key: &str) -> anyhow::Result<String> {
+    String::from_utf8(get_bytes(bucket, key).await?.into())
+        .context("deployment module is not UTF-8")
+}
+
+async fn get_bytes(bucket: &Bucket, key: &str) -> anyhow::Result<bytes::Bytes> {
     let (bytes, _) = bucket
         .get(key)
         .await?
         .with_context(|| format!("read s3://{}/{key}: no such key", bucket.name))?;
-    String::from_utf8(bytes.to_vec()).context("deployment module is not UTF-8")
+    Ok(bytes)
 }
 
 pub async fn load_current_worker(
@@ -372,6 +377,7 @@ async fn load_worker_from_pointer(
         &get_string(bucket, &format!("{}/manifest.json", pointer.prefix)).await?,
     )
     .context("decode deployment manifest")?;
+    crate::protocol::validate_required_features(&manifest.required_features)?;
     let src = match manifest.main_module.as_deref() {
         Some(main) => get_string(bucket, &format!("{}/{main}", pointer.prefix)).await?,
         None if manifest.assets.is_some() => {
@@ -383,13 +389,30 @@ async fn load_worker_from_pointer(
         }
         None => bail!("deployment has neither a main module nor assets"),
     };
-    let mut text = Vec::new();
-    for module in &manifest.modules {
-        if manifest.main_module.as_deref() == Some(module.name.as_str()) {
-            continue;
-        }
-        let source = get_string(bucket, &format!("{}/{}", pointer.prefix, module.name)).await?;
-        text.push((format!("./{}", module.name), source));
+    let prefix = &pointer.prefix;
+    let fetched = futures_util::future::try_join_all(
+        manifest
+            .modules
+            .iter()
+            .filter(|module| manifest.main_module.as_deref() != Some(module.name.as_str()))
+            .map(|module| async move {
+                let key = format!("{prefix}/{}", module.name);
+                anyhow::Ok((module, get_bytes(bucket, &key).await?))
+            }),
+    )
+    .await?;
+    let mut modules = Vec::new();
+    for (module, bytes) in fetched {
+        let entry = match module.kind {
+            Some(ModuleKind::Wasm) => (module.name.clone(), ModuleSource::Wasm(bytes)),
+            None => (
+                format!("./{}", module.name),
+                ModuleSource::Text(
+                    String::from_utf8(bytes.into()).context("deployment module is not UTF-8")?,
+                ),
+            ),
+        };
+        modules.push(entry);
     }
     let do_bindings = bindings(&manifest, "durable_object_namespace")
         .filter_map(|binding| {
@@ -436,7 +459,7 @@ async fn load_worker_from_pointer(
             ai_binding,
             vars,
             node,
-            text,
+            modules,
             compat,
         },
         script_name,

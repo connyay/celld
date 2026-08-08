@@ -4703,7 +4703,7 @@ async fn async_main() -> anyhow::Result<()> {
                 ai_binding: fleet::configured_ai_binding(None),
                 vars: Vec::new(),
                 node: node.clone(),
-                text: Vec::new(),
+                modules: Vec::new(),
                 compat: Compat::default(),
             };
             let (ownership, peer_key, wake, wake_scan) = match settings.bucket.clone() {

@@ -9,7 +9,7 @@
 use crate::bucket::Bucket;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
-    ModuleRef, Rollout, RunWorkerFirst,
+    ModuleKind, ModuleRef, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_WASM_V1,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -276,11 +276,15 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .transpose()?;
     let bundled_in = started.elapsed();
 
-    // esbuild emits one module, so the graph is always a single entry.
+    // esbuild emits one JS module plus a copy of every wasm file the bundle
+    // imports; the copies ship as sibling modules.
     let module_name = "index.js".to_string();
-    let modules = bundle
-        .map(|bundle| vec![(module_name.clone(), bundle)])
-        .unwrap_or_default();
+    let (mut modules, wasm_modules) = match bundle {
+        Some(output) => (vec![(module_name.clone(), output.bundle)], output.wasm),
+        None => (Vec::new(), Vec::new()),
+    };
+    let wasm_names: BTreeSet<String> = wasm_modules.iter().map(|(name, _)| name.clone()).collect();
+    modules.extend(wasm_modules);
     // Identity is over the exact metadata bytes the manifest retains, so the
     // serialization happens once and is reused for both.
     let metadata_json = serde_json::to_vec(&project.metadata)?;
@@ -309,13 +313,22 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 name: name.clone(),
                 bytes: bytes.len(),
                 sha256: format!("{:x}", Sha256::digest(bytes))[..16].to_string(),
+                kind: wasm_names.contains(name).then_some(ModuleKind::Wasm),
             })
             .collect(),
         assets: asset_reference,
-        required_features: if built_assets.is_some() {
-            vec!["assets-v1".to_string()]
-        } else {
-            Vec::new()
+        // Each capability the manifest depends on is named here, so a node
+        // that predates it rejects the deployment up front instead of
+        // partially deserializing the manifest and failing at worker load.
+        required_features: {
+            let mut features = Vec::new();
+            if built_assets.is_some() {
+                features.push(FEATURE_ASSETS_V1.to_string());
+            }
+            if !wasm_names.is_empty() {
+                features.push(FEATURE_WASM_V1.to_string());
+            }
+            features
         },
         raw_metadata: project.metadata,
     };
@@ -1072,11 +1085,19 @@ fn asset_content_type(path: &Path) -> Option<&'static str> {
     })
 }
 
-fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<Vec<u8>> {
+/// esbuild's outputs: the bundled entry module, and the wasm files its
+/// imports were resolved to (each under the name the rewritten import uses).
+struct BundleOutput {
+    bundle: Vec<u8>,
+    wasm: Vec<(String, Vec<u8>)>,
+}
+
+fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
     // node: builtins stay external. Wrangler polyfills them with unenv; celld
     // implements the workerd `nodejs_compat` subset itself, so the runtime
     // provides them.
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
+    let outdir = tempfile::tempdir().context("create esbuild output directory")?;
     let output = Command::new(&binary)
         .current_dir(root)
         .arg(entry)
@@ -1087,6 +1108,15 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<Vec<u8>> {
         .arg("--conditions=workerd,worker,browser")
         .arg("--external:node:*")
         .arg("--external:cloudflare:*")
+        // Wasm becomes a sibling module (Wrangler's CompiledWasm rule). The
+        // `copy` loader makes esbuild resolve each wasm import like any other
+        // import (importer-relative, node_modules, deduplicated) and rewrite
+        // the specifier to the copied file, so the bundle and the emitted
+        // files agree on names; the runtime serves each file as a compiled
+        // WebAssembly.Module default export.
+        .arg("--loader:.wasm=copy")
+        .arg(format!("--outdir={}", outdir.path().display()))
+        .arg("--entry-names=index")
         .output()
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -1105,7 +1135,28 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<Vec<u8>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(output.stdout)
+    let bundle =
+        std::fs::read(outdir.path().join("index.js")).context("read esbuild output bundle")?;
+    // The copied wasm files land beside the bundle; each becomes its own
+    // deployed module under the name the rewritten imports use.
+    let mut wasm = Vec::new();
+    for dirent in std::fs::read_dir(outdir.path()).context("read esbuild output directory")? {
+        let path = dirent?.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("wasm") {
+            let name = path
+                .file_name()
+                .expect("read_dir entries have a file name")
+                .to_string_lossy()
+                .into_owned();
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("read wasm module {}", path.display()))?;
+            wasm.push((name, bytes));
+        }
+    }
+    // read_dir order is platform-defined; the deployment version hashes the
+    // module list, so keep it stable.
+    wasm.sort();
+    Ok(BundleOutput { bundle, wasm })
 }
 
 /// Minimal JSONC support: line and block comments, and trailing commas.

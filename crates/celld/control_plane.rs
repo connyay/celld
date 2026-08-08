@@ -1476,9 +1476,17 @@ fn presence_request(
         HeaderName::from_static("x-cells-version"),
         HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
     );
+    // Deployment features come from the shared list so the advertised
+    // capabilities can never drift from what apply_deployment accepts.
+    let capabilities = crate::protocol::SUPPORTED_DEPLOYMENT_FEATURES
+        .iter()
+        .copied()
+        .chain(["sqlite-explorer-v1", "sqlite-explorer-v2"])
+        .collect::<Vec<_>>()
+        .join(",");
     headers.insert(
         HeaderName::from_static("x-cells-capabilities"),
-        HeaderValue::from_static("assets-v1,sqlite-explorer-v1,sqlite-explorer-v2"),
+        HeaderValue::from_str(&capabilities)?,
     );
     headers.insert(
         HeaderName::from_static("x-cells-hostname"),
@@ -1711,11 +1719,7 @@ async fn apply_deployment(
     }
     validate_managed_module_envelope(deployment)?;
     validate_managed_class_migrations(&deployment.manifest)?;
-    for feature in &deployment.manifest.required_features {
-        if feature != "assets-v1" {
-            return Err(anyhow!("unsupported deployment feature: {feature}"));
-        }
-    }
+    crate::protocol::validate_required_features(&deployment.manifest.required_features)?;
 
     let mut asset_files = 0_u32;
     let mut asset_bytes = 0_u64;

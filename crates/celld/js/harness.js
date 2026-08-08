@@ -1352,10 +1352,36 @@ globalThis.__makeLoader = () => {
       idPromise.then((id) => finalizer.register(stub, id), () => {});
     return stub;
   };
+  // JSON.stringify silently drops binary values, so each non-string module —
+  // wasm bytes as a BufferSource, or workerd's `{ wasm }` / `{ esModule }`
+  // module shapes — is normalized first: ES modules to plain strings, wasm
+  // pulled out into a side-band `[name, Uint8Array]` list the op reads
+  // directly, so multi-MB blobs never take a base64/JSON round-trip.
+  const toBytes = (v) => v instanceof ArrayBuffer ? new Uint8Array(v)
+    : ArrayBuffer.isView(v)
+      ? new Uint8Array(v.buffer, v.byteOffset, v.byteLength) : null;
+  const encodeModules = (c) => {
+    if (c === null || typeof c !== "object" || c.modules === null
+        || typeof c.modules !== "object") return { config: c, wasm: [] };
+    const modules = {};
+    const wasm = [];
+    for (const [name, value] of Object.entries(c.modules)) {
+      const wrapped = value !== null && typeof value === "object" ? value : {};
+      const bytes = toBytes(value) ?? toBytes(wrapped.wasm);
+      if (bytes !== null) wasm.push([name, bytes]);
+      else if (typeof wrapped.esModule === "string") modules[name] = wrapped.esModule;
+      else modules[name] = value;
+    }
+    return { config: { ...c, modules }, wasm };
+  };
   // getCode is deferred into a microtask so a throw (or async getCode)
   // surfaces as a rejection when the worker is first used, not at get()/load().
   const loadFrom = (getCode) =>
-    Promise.resolve().then(getCode).then((c) => __loader_load(JSON.stringify(c)));
+    Promise.resolve().then(getCode)
+      .then((c) => {
+        const { config, wasm } = encodeModules(c);
+        return __loader_load(JSON.stringify(config), wasm);
+      });
   return {
     load(code) { return makeStub(loadFrom(() => code), true); },
     get(name, getCode) {
@@ -2671,145 +2697,152 @@ function makeNamespace(className) {
   const namespaceKey = __cell.namespaceKeys[className];
   if (typeof namespaceKey !== "string")
     throw new Error("no Durable Object namespace key for " + className);
-  const namespace = {
-    idFromName(name) {
-      name = String(name);
-      return new DurableObjectId(
-        className, __do_id(namespaceKey, "name", name), name,
-      );
-    },
-    idFromString(value) {
-      return new DurableObjectId(
-        className, __do_id(namespaceKey, "validate", String(value)),
-      );
-    },
-    newUniqueId(options = {}) {
-      const jurisdiction = options == null ? undefined : options.jurisdiction;
-      if (jurisdiction != null)
-        throw new Error("Jurisdiction restrictions are not implemented");
-      return new DurableObjectId(
-        className, __do_id(namespaceKey, "unique", ""),
-      );
-    },
-    jurisdiction(value) {
-      if (value == null) return namespace;
+  return new DurableObjectNamespace(className, namespaceKey);
+}
+// A named class: SDKs sniff bindings by constructor name (workers-rs
+// EnvBinding requires `constructor.name === "DurableObjectNamespace"`).
+class DurableObjectNamespace {
+  constructor(className, namespaceKey) {
+    Object.defineProperty(this, "_className", { value: className });
+    Object.defineProperty(this, "_namespaceKey", { value: namespaceKey });
+  }
+  idFromName(name) {
+    name = String(name);
+    return new DurableObjectId(
+      this._className, __do_id(this._namespaceKey, "name", name), name,
+    );
+  }
+  idFromString(value) {
+    return new DurableObjectId(
+      this._className, __do_id(this._namespaceKey, "validate", String(value)),
+    );
+  }
+  newUniqueId(options = {}) {
+    const jurisdiction = options == null ? undefined : options.jurisdiction;
+    if (jurisdiction != null)
       throw new Error("Jurisdiction restrictions are not implemented");
-    },
-    getByName(name, options) {
-      return namespace.get(namespace.idFromName(name), options);
-    },
-    get(id) {
-      if (!(id instanceof DurableObjectId) || id._className !== className)
-        throw new TypeError("Durable Object ID is not valid for this namespace");
-      const scope = id._scope();
-      // Emulate production: the actor recovers its name only when it is
-      // <= 1024 UTF-8 bytes; longer names are dropped so ctx.id.name is
-      // undefined. The full name still seeds the routing hash, so
-      // dispatch is unchanged. Short names skip the byte count (< 256
-      // chars is always <= 1020 bytes) to keep the hot path alloc-free.
-      const nm = id.name;
-      const dispatchName = nm === undefined ? undefined
-        : nm.length < 256 || new TextEncoder().encode(nm).length <= 1024
-          ? nm : undefined;
-      if (dispatchName !== undefined) __cell.idNames[scope] = dispatchName;
-      // Fetch and native RPC use the same host routing/activation seam.
-      // Never expose `.then`: a DO stub is not itself a promise.
-      // `__celldDo` brands the stub so the RPC lift can send it as a
-      // revivable marker rather than failing the clone; non-enumerable
-      // so Object.keys(stub) stays Workerd's [id, name].
-      const target = { id, name: dispatchName };
-      Object.defineProperty(target, "__celldDo", { value: id });
-      const abortMarker = "__CELLD_ACTOR_ABORT__:";
-      const processExitMarker = "__CELLD_PROCESS_EXIT__:";
-      let brokenReason = null;
-      const invoke = async (operation) => {
-        if (brokenReason !== null) throw new Error(brokenReason);
-        try {
-          return await operation();
-        } catch (error) {
-          const routingError = __durableObjectRoutingError(error);
-          if (routingError !== null) throw routingError;
-          const message = String(error && error.message || error);
-          const marker = [abortMarker, processExitMarker]
-            .find((candidate) => message.includes(candidate));
-          if (!marker) throw error;
-          brokenReason = message.slice(message.indexOf(marker) + marker.length);
-          throw new Error(brokenReason);
+    return new DurableObjectId(
+      this._className, __do_id(this._namespaceKey, "unique", ""),
+    );
+  }
+  jurisdiction(value) {
+    if (value == null) return this;
+    throw new Error("Jurisdiction restrictions are not implemented");
+  }
+  getByName(name, options) {
+    return this.get(this.idFromName(name), options);
+  }
+  get(id) {
+    const className = this._className;
+    if (!(id instanceof DurableObjectId) || id._className !== className)
+      throw new TypeError("Durable Object ID is not valid for this namespace");
+    const scope = id._scope();
+    // Emulate production: the actor recovers its name only when it is
+    // <= 1024 UTF-8 bytes; longer names are dropped so ctx.id.name is
+    // undefined. The full name still seeds the routing hash, so
+    // dispatch is unchanged. Short names skip the byte count (< 256
+    // chars is always <= 1020 bytes) to keep the hot path alloc-free.
+    const nm = id.name;
+    const dispatchName = nm === undefined ? undefined
+      : nm.length < 256 || new TextEncoder().encode(nm).length <= 1024
+        ? nm : undefined;
+    if (dispatchName !== undefined) __cell.idNames[scope] = dispatchName;
+    // Fetch and native RPC use the same host routing/activation seam.
+    // Never expose `.then`: a DO stub is not itself a promise.
+    // `__celldDo` brands the stub so the RPC lift can send it as a
+    // revivable marker rather than failing the clone; non-enumerable
+    // so Object.keys(stub) stays Workerd's [id, name].
+    const target = { id, name: dispatchName };
+    Object.defineProperty(target, "__celldDo", { value: id });
+    const abortMarker = "__CELLD_ACTOR_ABORT__:";
+    const processExitMarker = "__CELLD_PROCESS_EXIT__:";
+    let brokenReason = null;
+    const invoke = async (operation) => {
+      if (brokenReason !== null) throw new Error(brokenReason);
+      try {
+        return await operation();
+      } catch (error) {
+        const routingError = __durableObjectRoutingError(error);
+        if (routingError !== null) throw routingError;
+        const message = String(error && error.message || error);
+        const marker = [abortMarker, processExitMarker]
+          .find((candidate) => message.includes(candidate));
+        if (!marker) throw error;
+        brokenReason = message.slice(message.indexOf(marker) + marker.length);
+        throw new Error(brokenReason);
+      }
+    };
+    const doFetch = async (input, init) => {
+        const req = new Request(input, init);
+        const signal = req._signalForSubrequests;
+        if (signal?.aborted) throw signal.reason;
+        // The DO seam carries exact bytes; a stream body is drained
+        // (and per spec disturbed) first.
+        const body_ = req._bodyBytes === null
+          ? await req._consume() : req._bodyBytes;
+        // Fast path: this isolate owns the target cell — run the DO
+        // in-isolate, avoiding the __do_call host round trip.
+        if (__cell.owned[scope]) {
+          return await invoke(() => __dispatchTo(
+            scope, req.url, req.method, body_,
+            JSON.stringify(Array.from(req.headers)),
+            null,
+            true,
+            signal,
+          ));
         }
-      };
-      const doFetch = async (input, init) => {
-          const req = new Request(input, init);
-          const signal = req._signalForSubrequests;
-          if (signal?.aborted) throw signal.reason;
-          // The DO seam carries exact bytes; a stream body is drained
-          // (and per spec disturbed) first.
-          const body_ = req._bodyBytes === null
-            ? await req._consume() : req._bodyBytes;
-          // Fast path: this isolate owns the target cell — run the DO
-          // in-isolate, avoiding the __do_call host round trip.
-          if (__cell.owned[scope]) {
-            return await invoke(() => __dispatchTo(
-              scope, req.url, req.method, body_,
-              JSON.stringify(Array.from(req.headers)),
-              null,
-              true,
-              signal,
-            ));
-          }
-          const r = JSON.parse(await invoke(() => {
-            if (!signal) return __do_call(
+        const r = JSON.parse(await invoke(() => {
+          if (!signal) return __do_call(
+            scope, dispatchName ?? null, req.url, req.method, body_,
+            JSON.stringify(Array.from(req.headers)),
+          );
+          return __awaitCancellableDoCall(
+            __do_call_cancellable(
               scope, dispatchName ?? null, req.url, req.method, body_,
               JSON.stringify(Array.from(req.headers)),
-            );
-            return __awaitCancellableDoCall(
-              __do_call_cancellable(
-                scope, dispatchName ?? null, req.url, req.method, body_,
-                JSON.stringify(Array.from(req.headers)),
-              ),
-              signal,
-            );
-          }));
-          const body = r.streamId !== undefined
-            ? new CelldHttpBodyStream(r.streamId)
-            : r.body !== undefined
-              ? r.body
-              : Uint8Array.from(r.bodyBytes || []);
-          return new Response(body, {
-            status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
-          });
-      };
-      const stub = new Proxy(target, { get: (_target, prop) => {
-        if (prop === "then") return undefined;
-        if (Reflect.has(_target, prop)) return Reflect.get(_target, prop);
-        if (prop === "fetch") return doFetch;
-        if (typeof prop !== "string") return undefined;
-        if (__cell.compat.fetcherGetPutDelete &&
-            (prop === "get" || prop === "put" || prop === "delete"))
-          return __fetcherHelper(doFetch, prop);
-        // Fast path: this isolate owns the target cell — run the DO RPC
-        // in-isolate, avoiding the __rpc_call host round trip. Still a
-        // structured clone each way: Workerd extracts a copy even for a
-        // same-isolate call, and JSON round-tripped here before. The
-        // reply decodes inside invoke() so abort/exit markers rethrown
-        // from the envelope still trip the broken-stub sniffing.
-        if (__cell.owned[scope])
-          return async (...args) => invoke(
-            async () => __rpcDes(await __dispatchRpc(
-              scope, prop, __rpcOut(args, true))),
+            ),
+            signal,
           );
-        // The routed channel also lifts: same-process dispatch
-        // re-enters this isolate, where the markers revive; bytes
-        // that land elsewhere revive as loud foreign stubs.
+        }));
+        const body = r.streamId !== undefined
+          ? new CelldHttpBodyStream(r.streamId)
+          : r.body !== undefined
+            ? r.body
+            : Uint8Array.from(r.bodyBytes || []);
+        return new Response(body, {
+          status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+        });
+    };
+    const stub = new Proxy(target, { get: (_target, prop) => {
+      if (prop === "then") return undefined;
+      if (Reflect.has(_target, prop)) return Reflect.get(_target, prop);
+      if (prop === "fetch") return doFetch;
+      if (typeof prop !== "string") return undefined;
+      if (__cell.compat.fetcherGetPutDelete &&
+          (prop === "get" || prop === "put" || prop === "delete"))
+        return __fetcherHelper(doFetch, prop);
+      // Fast path: this isolate owns the target cell — run the DO RPC
+      // in-isolate, avoiding the __rpc_call host round trip. Still a
+      // structured clone each way: Workerd extracts a copy even for a
+      // same-isolate call, and JSON round-tripped here before. The
+      // reply decodes inside invoke() so abort/exit markers rethrown
+      // from the envelope still trip the broken-stub sniffing.
+      if (__cell.owned[scope])
         return async (...args) => invoke(
-          async () => __rpcDes(await __rpc_call(
-            scope, dispatchName ?? null, prop, __rpcOut(args, true),
-          )),
+          async () => __rpcDes(await __dispatchRpc(
+            scope, prop, __rpcOut(args, true))),
         );
-      }});
-      return stub;
-    }
-  };
-  return namespace;
+      // The routed channel also lifts: same-process dispatch
+      // re-enters this isolate, where the markers revive; bytes
+      // that land elsewhere revive as loud foreign stubs.
+      return async (...args) => invoke(
+        async () => __rpcDes(await __rpc_call(
+          scope, dispatchName ?? null, prop, __rpcOut(args, true),
+        )),
+      );
+    }});
+    return stub;
+  }
 }
 const __attachResponseRequestCancellation = (
   response,
@@ -3030,26 +3063,32 @@ const __entrypointInstance = (name) => {
 // to that class's fetch, not the module's default export. A plain
 // object export (Workerd's non-class entrypoint) dispatches its
 // handler functions as fn(arg, env, ctx).
-globalThis.__dispatchEntrypointFetch = async (name, request) => {
+const __dispatchEntrypointMethod = async (name, method, arg) => {
   const handler = __cell.objectEntrypoints[name];
   if (handler !== undefined) {
-    if (typeof handler.fetch !== "function")
+    if (typeof handler[method] !== "function")
       throw new TypeError(
-        `Entrypoint ${JSON.stringify(name)} has no fetch handler`);
+        `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
     const ctx = __beginEvent();
     try {
       return await __ctxRun(undefined,
-        () => handler.fetch(request, __cell.env, ctx));
+        () => handler[method](arg, __cell.env, ctx));
     } finally {
       __endEvent();
     }
   }
+  // A class entrypoint's methods get env and ctx from its constructor,
+  // not as arguments.
   const inst = __entrypointInstance(name);
-  if (typeof inst.fetch !== "function")
+  if (typeof inst[method] !== "function")
     throw new TypeError(
-      `Entrypoint ${JSON.stringify(name)} has no fetch handler`);
-  return await __ctxRun(undefined, () => inst.fetch(request));
+      `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
+  return await __ctxRun(undefined, () => inst[method](arg));
 };
+globalThis.__dispatchEntrypointFetch = (name, request) =>
+  __dispatchEntrypointMethod(name, "fetch", request);
+globalThis.__dispatchEntrypointScheduled = (name, ctrl) =>
+  __dispatchEntrypointMethod(name, "scheduled", ctrl);
 // Workerd's simple-handler RPC rules (worker-rpc.c++): a non-class
 // handler method is called as fn(arg, env, ctx), the client must send
 // exactly one argument, and the handler must not declare more than
