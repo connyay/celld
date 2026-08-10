@@ -491,16 +491,31 @@ fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)
         .collect()
 }
 
-fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
+/// Vars declared in the manifest itself; the file and process-env overrides
+/// layer on in `worker_vars`, keeping this half free of process state.
+fn manifest_vars(manifest: &Manifest) -> BTreeMap<String, serde_json::Value> {
     let mut vars = BTreeMap::new();
     for binding in bindings(manifest, "plain_text") {
         if let (Some(name), Some(value)) = (
             binding.get("name").and_then(serde_json::Value::as_str),
             binding.get("text").and_then(serde_json::Value::as_str),
         ) {
-            vars.insert(name.to_string(), value.to_string());
+            vars.insert(name.to_string(), serde_json::Value::from(value));
         }
     }
+    for binding in bindings(manifest, "json") {
+        if let (Some(name), Some(value)) = (
+            binding.get("name").and_then(serde_json::Value::as_str),
+            binding.get("json"),
+        ) {
+            vars.insert(name.to_string(), value.clone());
+        }
+    }
+    vars
+}
+
+fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    let mut vars = manifest_vars(manifest);
     if let Ok(path) = std::env::var("CELLD_VARS_FILE") {
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("read Worker vars file {path}"))?;
@@ -524,7 +539,7 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
                         .and_then(|value| value.strip_suffix('\''))
                 })
                 .unwrap_or(raw);
-            vars.insert(name.to_string(), value.to_string());
+            vars.insert(name.to_string(), serde_json::Value::from(value));
         }
     }
     for (name, value) in std::env::vars() {
@@ -532,8 +547,44 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
             .strip_prefix("CELLD_VAR_")
             .filter(|name| !name.is_empty())
         {
-            vars.insert(name.to_string(), value);
+            vars.insert(name.to_string(), serde_json::Value::from(value));
         }
     }
     Ok(vars.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_vars_preserve_json_values() {
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "version": "test",
+            "script_name": "test",
+            "main_module": "index.js",
+            "do_classes": [],
+            "sqlite_classes": [],
+            "modules": [],
+            "raw_metadata": {
+                "bindings": [
+                    { "type": "plain_text", "name": "TEXT", "text": "value" },
+                    {
+                        "type": "json",
+                        "name": "OBJECT",
+                        "json": { "nested": [true, 7] }
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+        let vars = manifest_vars(&manifest);
+        assert_eq!(vars.get("TEXT"), Some(&serde_json::json!("value")));
+        assert_eq!(
+            vars.get("OBJECT"),
+            Some(&serde_json::json!({ "nested": [true, 7] }))
+        );
+    }
 }

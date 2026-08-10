@@ -179,7 +179,7 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission |
 | `CELLD_MAX_RSS_MB` | The memory threshold for pressure shedding (default: 80% of the available memory; 0 disables it) |
 | `CELLD_MAX_CPU_PERCENT` | The CPU threshold for pressure shedding (off unless set) |
-| `CELLD_VAR_*`, `CELLD_VARS_FILE` | Worker variable overrides |
+| `CELLD_VAR_*`, `CELLD_VARS_FILE` | Worker variable overrides. Override values are always strings; overriding a JSON var replaces it with a string |
 | `RUST_LOG` | The runtime log filter |
 
 The help output also shows the advanced tuning switches and their

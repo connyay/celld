@@ -1880,7 +1880,7 @@ pub struct WorkerConfig {
     bindings: Vec<(String, String)>,
     r2_bindings: Vec<String>,
     ai_binding: Option<String>,
-    vars: Vec<(String, String)>,
+    vars: Vec<(String, serde_json::Value)>,
     node: String,
     text: Vec<(String, String)>,
     compat: Compat,
@@ -1908,7 +1908,7 @@ pub struct WorkerConfigOptions {
     pub bindings: Vec<(String, String)>,
     pub r2_bindings: Vec<String>,
     pub ai_binding: Option<String>,
-    pub vars: Vec<(String, String)>,
+    pub vars: Vec<(String, serde_json::Value)>,
     pub node: String,
     pub text: Vec<(String, String)>,
     pub compat: Compat,
@@ -6835,7 +6835,7 @@ fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
             ));
         }
         for (name, value) in vars {
-            lines.push_str(&format!("e[{:?}] = {:?};\n", name, value));
+            lines.push_str(&var_assignment(name, value));
         }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
@@ -6858,6 +6858,17 @@ fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
     let s = v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("env compile"))?;
     s.run(scope).ok_or_else(|| anyhow!("env run"))?;
     Ok(())
+}
+
+// Values go through JSON.parse rather than being spliced in as object
+// literals, matching workerd: a literal would treat a nested non-computed
+// `"__proto__"` key as setting [[Prototype]] instead of an own property.
+fn var_assignment(name: &str, value: &serde_json::Value) -> String {
+    format!(
+        "e[{:?}] = JSON.parse({});\n",
+        name,
+        serde_json::Value::from(value.to_string())
+    )
 }
 
 /// Record every exported class deriving from `WorkerEntrypoint` in
@@ -7817,4 +7828,30 @@ mod conformance_runtime_tests {
 #[cfg(all(test, celld_internal_tests))]
 mod conformance_web_platform_tests {
     include!(env!("CELLD_CONFORMANCE_WEB_PLATFORM_TESTS"));
+}
+
+#[cfg(test)]
+mod var_tests {
+    use super::*;
+
+    #[test]
+    fn var_assignment_emits_structured_json() {
+        assert_eq!(
+            var_assignment("TEXT", &serde_json::json!("value")),
+            "e[\"TEXT\"] = JSON.parse(\"\\\"value\\\"\");\n"
+        );
+        assert_eq!(
+            var_assignment("CONFIG", &serde_json::json!({ "enabled": true })),
+            "e[\"CONFIG\"] = JSON.parse(\"{\\\"enabled\\\":true}\");\n"
+        );
+        // A nested __proto__ key must survive as an own property (via
+        // JSON.parse), not become an object-literal prototype assignment.
+        assert_eq!(
+            var_assignment(
+                "CONFIG",
+                &serde_json::json!({ "__proto__": { "admin": true } })
+            ),
+            "e[\"CONFIG\"] = JSON.parse(\"{\\\"__proto__\\\":{\\\"admin\\\":true}}\");\n"
+        );
+    }
 }

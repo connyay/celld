@@ -62,7 +62,7 @@ directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
 OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket s3://NAME     Fleet bucket; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain.\n\n\
 Worker projects require `esbuild` on PATH; asset-only projects do not. Static\n\
-assets, service bindings, and string vars are supported. Routes are not; use\n\
+assets, service bindings, and JSON vars are supported. Routes are not; use\n\
 Wrangler for route configuration.\n\
 Nodes load a deployment at startup, so an existing node keeps serving the old\n\
 version until it restarts."
@@ -234,6 +234,10 @@ impl Built {
                     }
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
+                        "Environment Variable".to_string(),
+                    )),
+                    Some("json") => Some((
+                        format!("env.{name} (JSON)"),
                         "Environment Variable".to_string(),
                     )),
                     _ => None,
@@ -573,14 +577,7 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         if !valid_binding(name) {
             bail!("invalid var binding name: {name:?}");
         }
-        let value = value
-            .as_str()
-            .ok_or_else(|| anyhow!("var binding {name} must be a string"))?;
-        bindings.push(json!({
-            "type": "plain_text",
-            "name": name,
-            "text": value,
-        }));
+        bindings.push(var_binding(name, value));
         var_count += 1;
     }
     if main.is_none()
@@ -629,6 +626,21 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         do_classes,
         sqlite_classes,
     })
+}
+
+fn var_binding(name: &str, value: &Value) -> Value {
+    match value {
+        Value::String(value) => json!({
+            "type": "plain_text",
+            "name": name,
+            "text": value,
+        }),
+        value => json!({
+            "type": "json",
+            "name": name,
+            "json": value,
+        }),
+    }
 }
 
 fn read_sqlite_classes(project: &Map<String, Value>) -> anyhow::Result<Vec<String>> {
@@ -863,7 +875,10 @@ fn optional_asset_mode(
 }
 
 fn valid_binding(binding: &str) -> bool {
-    binding.len() <= 128
+    // `__proto__` would assign through the env object's prototype setter
+    // instead of defining a variable, and is unusable on Workers anyway.
+    binding != "__proto__"
+        && binding.len() <= 128
         && binding
             .chars()
             .next()
@@ -1162,4 +1177,31 @@ fn strip_jsonc(source: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_names_reject_proto() {
+        assert!(!valid_binding("__proto__"));
+        assert!(valid_binding("__proto"));
+    }
+
+    #[test]
+    fn vars_use_wrangler_plain_text_and_json_bindings() {
+        assert_eq!(
+            var_binding("TEXT", &json!("value")),
+            json!({ "type": "plain_text", "name": "TEXT", "text": "value" })
+        );
+        assert_eq!(
+            var_binding("OBJECT", &json!({ "nested": [true, 7] })),
+            json!({
+                "type": "json",
+                "name": "OBJECT",
+                "json": { "nested": [true, 7] },
+            })
+        );
+    }
 }

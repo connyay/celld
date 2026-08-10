@@ -130,8 +130,8 @@ rather than reported as enabled, and celld accepts it without effect.
 and accepts `wrangler.jsonc` or `wrangler.json`, not `wrangler.toml`.
 The available config keys are `name`, `main`,
 `compatibility_date`, `compatibility_flags`, `durable_objects`,
-`migrations`, `assets`, `services`, and `vars`. An asset-only project can
-omit `main`. celld refuses symlinks and special files in the asset
+`migrations`, `assets`, `services`, and `vars` (string and JSON values). An
+asset-only project can omit `main`. celld refuses symlinks and special files in the asset
 directory, and `.assetsignore` still needs Wrangler. Each other key —
 `routes`, `kv_namespaces`, `triggers`, and the rest — stops the deploy
 with an error that names the key: remove the key, or deploy that project
